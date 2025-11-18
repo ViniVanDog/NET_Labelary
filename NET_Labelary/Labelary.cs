@@ -14,12 +14,11 @@ namespace NET_Labelary
 {
     public static class Labelary
     {
-        // ---------- free-plan limits ----------
         private const int MAX_LABELS_PER_CALL = 50;
-        private const int MAX_BYTES_PER_CALL = 900 * 1024; // keep a margin below 1 MB
-        private static readonly TimeSpan MIN_DELAY_BETWEEN_CALLS = TimeSpan.FromMilliseconds(350); //  ≈2.8 req/s 
+        private const int MAX_BYTES_PER_CALL = 900 * 1024;              // request body limit (keep margin under 1MB)
+        private const int MAX_EMBEDDED_IMAGE_BYTES_PER_CALL = 1_800_000; // heuristic < 2MB fonts+images
+        private static readonly TimeSpan MIN_DELAY_BETWEEN_CALLS = TimeSpan.FromMilliseconds(350);
 
-        // ---------- HttpClient ----------
         private static readonly HttpClient _http = new HttpClient
         {
             Timeout = TimeSpan.FromSeconds(30)
@@ -33,105 +32,233 @@ namespace NET_Labelary
             {
                 var psi = new ProcessStartInfo
                 {
-                    FileName = fullPath,   // caminho do PDF
-                    UseShellExecute = true,       // <-- necessário no .NET Core/5/6/7/8
-                    Verb = "open"      // opcional, deixa explícito
+                    FileName = fullPath,
+                    UseShellExecute = true,
+                    Verb = "open"
                 };
                 Process.Start(psi);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Labelary] could not open : {ex.Message}");
+                Console.WriteLine("[Labelary] could not open : " + ex.Message);
             }
         }
-
-        // ---------- public façade ----------
         public static async Task SendTo(string zplCode)
         {
-            Console.WriteLine($"[Labelary] total raw length = {zplCode.Length:N0} chars");
+            Console.WriteLine("[Labelary] total raw length = " + zplCode.Length.ToString("N0") + " chars");
             var pdfs = await RenderAsync(zplCode).ConfigureAwait(false);
 
-            Console.WriteLine($"[Labelary] finished – PDF(s) saved: {pdfs.Count}");
+            Console.WriteLine("[Labelary] finished – PDF(s) saved: " + pdfs.Count);
             foreach (var path in pdfs)
                 OpenPdf(path);
         }
 
-        // ---------- pipeline ----------
-        private static async Task<List<string>> RenderAsync(string allZpl, CancellationToken ct = default)
+        private static async Task<List<string>> RenderAsync(string allZpl, CancellationToken ct = default(CancellationToken))
         {
             var labels = SplitLabels(allZpl);
-            Console.WriteLine($"[Labelary] found {labels.Count} ^XA labels");
-
-            var batches = BuildBatches(labels).ToList();
-            Console.WriteLine($"[Labelary] batching into {batches.Count} call(s)");
+            Console.WriteLine("[Labelary] found " + labels.Count + " ^XA labels");
 
             var saved = new List<string>();
-            int idx = 1;
+            int batchIndex = 1;
+            int i = 0;
 
-            // ensure files are stored in a writable folder
             string outDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "labels");
             Directory.CreateDirectory(outDir);
 
-            foreach (var batch in batches)
+            while (i < labels.Count)
             {
-                Console.WriteLine($"[Labelary] ▶ batch {idx} – {batch.Length:N0} chars");
+                string batchZpl;
+                int labelsUsed;
+                int byteCount;
+                int imageBytes;
 
-                byte[] pdf = await SendBatchAsync(batch, ct);
+                BuildBatchFromIndex(labels, i, out batchZpl, out labelsUsed, out byteCount, out imageBytes);
 
-                string file = Path.Combine(outDir, $"{DateForSave()}-label-{idx:D3}.pdf");
+                if (labelsUsed == 0)
+                {
+                    batchZpl = labels[i];
+                    labelsUsed = 1;
+                    byteCount = Encoding.ASCII.GetByteCount(batchZpl);
+                    imageBytes = EstimateEmbeddedImageBytes(batchZpl);
+                }
+
+                Console.WriteLine(
+                    "[Labelary] ▶ batch " + batchIndex +
+                    " – labels " + labelsUsed +
+                    ", bytes " + byteCount.ToString("N0") +
+                    ", embedded image bytes ~ " + imageBytes.ToString("N0"));
+
+                byte[] pdf = await SendBatchAsync(batchZpl, ct).ConfigureAwait(false);
+
+                string file = Path.Combine(outDir,
+                    DateForSave() + "-label-" + batchIndex.ToString("D3") + ".pdf");
+
                 File.WriteAllBytes(file, pdf);
-                Console.WriteLine($"[Labelary]   ✓ received {pdf.Length:N0} bytes → {file}");
+                Console.WriteLine("[Labelary]   ✓ received " + pdf.Length.ToString("N0") + " bytes → " + file);
                 saved.Add(file);
-                idx++;
+
+                i += labelsUsed;
+                batchIndex++;
             }
 
             return saved;
         }
-        private static List<string> SplitLabels(string bigZpl) =>
-                Regex.Split(bigZpl, @"(?=\^XA)", RegexOptions.Multiline)
-                 .Where(s => !string.IsNullOrWhiteSpace(s))
-                  .ToList();
-        private static IEnumerable<string> BuildBatches(IEnumerable<string> labels)
+
+        // keeps full ZPL sequence but ensures each "label" starts with ^XA
+        private static List<string> SplitLabels(string bigZpl)
         {
-            var sb = new StringBuilder();
-            int lblCount = 0;
-            int byteCount = 0;
+            var parts = Regex.Split(bigZpl, @"(?=\^XA)", RegexOptions.Multiline);
+            var labels = new List<string>();
+            var carry = new StringBuilder();
 
-            foreach (var lbl in labels)
+            foreach (var raw in parts)
             {
-                int bytes = Encoding.ASCII.GetByteCount(lbl);
+                var part = raw;
+                if (string.IsNullOrWhiteSpace(part))
+                    continue;
 
-                bool full = lblCount == MAX_LABELS_PER_CALL ||
-                            byteCount + bytes > MAX_BYTES_PER_CALL;
-
-                if (full)
+                if (part.StartsWith("^XA", StringComparison.Ordinal))
                 {
-                    yield return sb.ToString();
-                    sb.Clear();
-                    lblCount = 0;
-                    byteCount = 0;
-                }
+                    if (carry.Length > 0)
+                    {
+                        if (labels.Count > 0)
+                        {
+                            labels[labels.Count - 1] += carry.ToString();
+                        }
+                        else
+                        {
+                            part = carry.ToString() + part;
+                        }
+                        carry.Clear();
+                    }
 
-                sb.Append(lbl);
-                lblCount++;
-                byteCount += bytes;
+                    labels.Add(part);
+                }
+                else
+                {
+                    carry.Append(part);
+                }
             }
 
-            if (lblCount > 0)
-                yield return sb.ToString();
+            if (carry.Length > 0 && labels.Count > 0)
+            {
+                labels[labels.Count - 1] += carry.ToString();
+            }
+
+            return labels;
         }
+
+        // batches by: label count, request size, and estimated embedded image weight (~DG/^GF)
+        private static void BuildBatchFromIndex(
+            IList<string> labels,
+            int startIndex,
+            out string zplBatch,
+            out int labelsUsed,
+            out int byteCount,
+            out int imageBytes)
+        {
+            var sb = new StringBuilder();
+            labelsUsed = 0;
+            byteCount = 0;
+            imageBytes = 0;
+
+            int hardLimit = MAX_LABELS_PER_CALL;
+
+            for (int offset = 0; offset < hardLimit && (startIndex + offset) < labels.Count; offset++)
+            {
+                string lbl = labels[startIndex + offset];
+                int bytes = Encoding.ASCII.GetByteCount(lbl);
+                int imgBytes = EstimateEmbeddedImageBytes(lbl);
+
+                bool wouldOverflowBody = labelsUsed > 0 && (byteCount + bytes > MAX_BYTES_PER_CALL);
+                bool wouldOverflowImages = labelsUsed > 0 && (imageBytes + imgBytes > MAX_EMBEDDED_IMAGE_BYTES_PER_CALL);
+
+                if (wouldOverflowBody || wouldOverflowImages)
+                    break;
+
+                sb.Append(lbl);
+                labelsUsed++;
+                byteCount += bytes;
+                imageBytes += imgBytes;
+            }
+
+            zplBatch = sb.ToString();
+        }
+
+        // estimate embedded image bytes from ~DG / ~DGR and ^GF commands
+        private static int EstimateEmbeddedImageBytes(string zpl)
+        {
+            if (string.IsNullOrEmpty(zpl))
+                return 0;
+
+            int total = 0;
+
+            // ~DG / ~DGR: ~DGR:NAME.GRF,124236,102,:Z64:...
+            var dgMatches = Regex.Matches(
+                zpl,
+                @"~DG[RF]?:[^,]*,(\d+),",
+                RegexOptions.IgnoreCase);
+
+            foreach (Match m in dgMatches)
+            {
+                int val;
+                if (int.TryParse(m.Groups[1].Value, out val))
+                    total += val;
+            }
+
+            // ^GFo,h,w,data (h = total bytes of graphic data)
+            int idx = 0;
+            while (true)
+            {
+                idx = zpl.IndexOf("^GF", idx, StringComparison.OrdinalIgnoreCase);
+                if (idx < 0)
+                    break;
+
+                int fs = zpl.IndexOf("^FS", idx + 3, StringComparison.OrdinalIgnoreCase);
+                if (fs < 0)
+                    fs = zpl.Length;
+
+                string field = zpl.Substring(idx, fs - idx);
+                string[] parts = field.Split(',');
+
+                if (parts.Length >= 3)
+                {
+                    // parts[0]: "^GFo" (orientation included)
+                    // parts[1]: h (total bytes) – may have non-digits, strip them
+                    string raw = parts[1];
+                    var sb = new StringBuilder();
+                    for (int i = 0; i < raw.Length; i++)
+                    {
+                        char c = raw[i];
+                        if (char.IsDigit(c))
+                            sb.Append(c);
+                    }
+
+                    int val;
+                    if (sb.Length > 0 && int.TryParse(sb.ToString(), out val))
+                        total += val;
+                }
+
+                idx = fs;
+            }
+
+            return total;
+        }
+
         private static async Task<byte[]> SendBatchAsync(string zplBatch, CancellationToken ct = default(CancellationToken))
         {
-            var wait = _nextSlotUtc - DateTime.UtcNow;
+            TimeSpan wait = _nextSlotUtc - DateTime.UtcNow;
             if (wait > TimeSpan.Zero)
-                await Task.Delay(wait, ct);
+                await Task.Delay(wait, ct).ConfigureAwait(false);
+
             _nextSlotUtc = DateTime.UtcNow + MIN_DELAY_BETWEEN_CALLS;
 
             byte[] payload = Encoding.UTF8.GetBytes(zplBatch);
             var content = new ByteArrayContent(payload);
             content.Headers.ContentType = new MediaTypeHeaderValue("application/x-www-form-urlencoded");
 
-            var request = new HttpRequestMessage(HttpMethod.Post,
+            var request = new HttpRequestMessage(
+                HttpMethod.Post,
                 "https://api.labelary.com/v1/printers/8dpmm/labels/4x6/")
             {
                 Content = content
@@ -140,28 +267,27 @@ namespace NET_Labelary
 
             Console.WriteLine("[Labelary]   → POST " + payload.Length.ToString("N0") + " bytes");
 
-            var resp = await _http.SendAsync(request,
-                                             HttpCompletionOption.ResponseHeadersRead,
-                                             ct);
+            HttpResponseMessage resp = await _http
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct)
+                .ConfigureAwait(false);
 
-            Console.WriteLine("[Labelary]   ← " + ((int)resp.StatusCode) + " " + resp.ReasonPhrase);
+            Console.WriteLine("[Labelary]   ← " + (int)resp.StatusCode + " " + resp.ReasonPhrase);
 
             if (!resp.IsSuccessStatusCode)
             {
-                string err = await resp.Content.ReadAsStringAsync();
+                string err = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                 Console.WriteLine("[Labelary]     body: " + err);
-                throw new Exception("Labelary falhou (" + (int)resp.StatusCode + "): " + resp.ReasonPhrase);
+                throw new Exception("Labelary failed (" + (int)resp.StatusCode + "): " + resp.ReasonPhrase);
             }
 
-            var bytes = await resp.Content.ReadAsByteArrayAsync();
+            byte[] bytes = await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
             Console.WriteLine("[Labelary]   ✓ OK " + bytes.Length.ToString("N0") + " bytes");
             return bytes;
         }
+
         public static string DateForSave()
         {
-            var dateTime = DateTime.Now.ToString("dd-MM-yyyy");
-
-            return dateTime;
+            return DateTime.Now.ToString("dd-MM-yyyy");
         }
     }
 }
