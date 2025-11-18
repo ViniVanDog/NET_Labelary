@@ -7,6 +7,7 @@
   - Rate-limiting between requests
   - Safe handling of large inputs
   - Handles labels made of large base64 image blocks instead of vector ZPL commands
+
 Only works on Windows, .NET Framework 4.8
 
 ---
